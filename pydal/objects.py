@@ -93,7 +93,7 @@ class Row(BasicStorage):
         except Exception as e:
             raise e
 
-        raise KeyError
+        raise KeyError(key)
 
     __str__ = __repr__ = lambda self: '<Row %s>' % \
         self.as_dict(custom_types=[LazySet])
@@ -234,6 +234,7 @@ class Table(Serializable, BasicStorage):
         super(Table, self).__init__()
         self._actual = False  # set to True by define_table()
         self._db = db
+        self._migrate = None
         self._tablename = self._dalname = tablename
         if not isinstance(tablename, str) or hasattr(DAL, tablename) or not \
            REGEX_VALID_TB_FLD.match(tablename) or \
@@ -337,15 +338,15 @@ class Table(Serializable, BasicStorage):
 
         fieldnames_set = set()
         reserved = dir(Table) + ['fields']
-        if (db and db.check_reserved):
-            check_reserved = db.check_reserved_keyword
+        if (db and db._check_reserved):
+            check_reserved_keyword = db.check_reserved_keyword
         else:
-            def check_reserved(field_name):
+            def check_reserved_keyword(field_name):
                 if field_name in reserved:
                     raise SyntaxError("field name %s not allowed" % field_name)
         for field in fields:
             field_name = field.name
-            check_reserved(field_name)
+            check_reserved_keyword(field_name)
             if db and db._ignore_field_case:
                 fname_item = field_name.lower()
             else:
@@ -397,7 +398,9 @@ class Table(Serializable, BasicStorage):
                                   archive_name='%(tablename)s_archive',
                                   is_active='is_active',
                                   current_record='current_record',
-                                  current_record_label=None):
+                                  current_record_label=None,
+                                  migrate=None,
+                                  redefine=None):
         db = self._db
         archive_db = archive_db or db
         archive_name = archive_name % dict(tablename=self._dalname)
@@ -412,10 +415,20 @@ class Table(Serializable, BasicStorage):
             clones.append(
                 field.clone(unique=False, type=field.type if nfk else 'bigint')
                 )
+        
+        d = dict(format=self._format)
+        if migrate:
+            d['migrate'] = migrate
+        elif isinstance(self._migrate, basestring):
+            d['migrate'] = self._migrate+'_archive'
+        elif self._migrate:
+            d['migrate'] = self._migrate
+        if redefine:
+            d['redefine'] = redefine
         archive_db.define_table(
             archive_name,
-            Field(current_record, field_type, label=current_record_label),
-            *clones, **dict(format=self._format))
+            Field(current_record, field_type, label=current_record_label), 
+            *clones, **d)
 
         self._before_update.append(
             lambda qset, fs, db=archive_db, an=archive_name, cn=current_record:
@@ -434,7 +447,7 @@ class Table(Serializable, BasicStorage):
                 self._common_filter = lambda q: reduce(
                     AND, [query(q), newquery(q)])
             else:
-                self._common_filter = newquery
+                self._common_filter = newquery 
 
     def _validate(self, **vars):
         errors = Row()
@@ -756,12 +769,19 @@ class Table(Serializable, BasicStorage):
                 f(row, ret)
         return ret
 
-    def _validate_fields(self, fields):
+    def _validate_fields(self, fields, defattr='default'):
         response = Row()
         response.id, response.errors, new_fields = None, Row(), Row()
         for field in self:
             # we validate even if not passed in case it is required
-            value, error = field.validate(fields.get(field.name))
+            error = default = None
+            if not field.required and not field.compute:
+                default = getattr(field, defattr)
+                if callable(default):
+                    default = default()
+            if not field.compute:
+                value = fields.get(field.name, default)
+                value, error = field.validate(value)
             if error:
                 response.errors[field.name] = "%s" % error
             elif field.name in fields:
@@ -770,13 +790,13 @@ class Table(Serializable, BasicStorage):
         return response, new_fields
 
     def validate_and_insert(self, **fields):
-        response, new_fields = self._validate_fields(fields)
+        response, new_fields = self._validate_fields(fields, 'default')
         if not response.errors:
             response.id = self.insert(**new_fields)
         return response
 
     def validate_and_update(self, _key=DEFAULT, **fields):        
-        response, new_fields = self._validate_fields(fields)
+        response, new_fields = self._validate_fields(fields, 'update')
         #: select record(s) for update
         if _key is DEFAULT:
             record = self(**fields)
@@ -1043,6 +1063,11 @@ class Table(Serializable, BasicStorage):
         return table_as_dict
 
     def with_alias(self, alias):
+        try:
+            if self._db[alias]._rname == self._rname:
+                return self._db[alias]
+        except AttributeError: # we never used this alias
+            pass
         other = copy.copy(self)
         other['ALL'] = SQLALL(other)
         other['_tablename'] = alias
@@ -2714,10 +2739,23 @@ class Rows(BasicRows):
                             box[attribute] = method()
         return self
 
-    def __and__(self, other):
+    def __add__(self, other):
         if self.colnames != other.colnames:
             raise Exception('Cannot & incompatible Rows objects')
         records = self.records + other.records
+        return self.__class__(
+            self.db, records, self.colnames, fields=self.fields,
+            compact=self.compact or other.compact)
+
+    def __and__(self, other):
+        if self.colnames != other.colnames:
+            raise Exception('Cannot & incompatible Rows objects')
+        records = []
+        other_records = list(other.records)
+        for record in self.records:
+            if record in other_records:
+                records.append(record)
+                other_records.remove(record)
         return self.__class__(
             self.db, records, self.colnames, fields=self.fields,
             compact=self.compact or other.compact)
